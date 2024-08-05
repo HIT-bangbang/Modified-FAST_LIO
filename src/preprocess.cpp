@@ -988,7 +988,7 @@ void Preprocess::rs_handler(const sensor_msgs::PointCloud2_<allocator<void>>::Co
     added_pt.y = pl_orig.points[i].y;
     added_pt.z = pl_orig.points[i].z;
     added_pt.intensity = pl_orig.points[i].intensity;
-    added_pt.curvature = (pl_orig.points[i].timestamp - pl_orig.points[0].timestamp) * 1000.0; // curvature unit: ms 只是借用了curvature的位置来存一下每个点相对于第一个点的相对时间
+    added_pt.curvature = (pl_orig.points[i].timestamp - pl_orig.points[0].timestamp) * 1000.0; // curvature unit: ms
     // std::cout << "added_pt.curvature:" << added_pt.curvature << std::endl;
 
     if (!given_offset_time)
@@ -1024,7 +1024,6 @@ void Preprocess::rs_handler(const sensor_msgs::PointCloud2_<allocator<void>>::Co
       time_last[layer] = added_pt.curvature;
     }
 
-    // 一个很粗暴的下采样和盲区
     if (i % point_filter_num == 0)
     {
       if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind) )

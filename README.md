@@ -1,19 +1,3 @@
-# 说明
-
-本仓库是对 大佬的项目 S-FAST_LIO 的学习、代码注释和改进修改。
-
-原项目地址 https://github.com/zlwang7/S-FAST_LIO.git
-
-原始的代码存放于 origin-code 分支
-
-## ToDo
-
-1. 详细的代码注释，master-分支
-
-2. 改进使用最新的 sophus 库（随着ubuntu和eigen的更新，老sophus库编译时报错太多）
-
-
-# 下面是原作者的README：
 # S-FAST_LIO
 ## Simplified Implementation of FAST_LIO
 
