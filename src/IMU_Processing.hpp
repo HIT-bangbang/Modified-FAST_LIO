@@ -156,13 +156,16 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf &kf_state, in
   }
   
   state_ikfom init_state = kf_state.get_x();        //在esekfom.hpp获得x_的状态
-  init_state.grav = - mean_acc / mean_acc.norm() * G_m_s2;    //得平均测量的单位方向向量 * 重力加速度预设值
+  init_state.grav = - mean_acc / mean_acc.norm() * G_m_s2;    //得平均测量的单位方向向量 * 重力加速度预设值。这里的处理是为了适应不同厂家的IMU可能重力不是9.81
   
+  // 设置初始的state
+  //这里并没有初始化ba，直接默认ba初始时是等于0的
   init_state.bg  = mean_gyr;      //角速度测量作为陀螺仪偏差
   init_state.offset_T_L_I = Lidar_T_wrt_IMU;      //将lidar和imu外参传入
   init_state.offset_R_L_I = Sophus::SO3(Lidar_R_wrt_IMU);
   kf_state.change_x(init_state);      //将初始化后的状态传入esekfom.hpp中的x_
 
+  // 设置协方差的初始值
   Matrix<double, 24, 24> init_P = MatrixXd::Identity(24,24);      //在esekfom.hpp获得P_的协方差矩阵
   init_P(6,6) = init_P(7,7) = init_P(8,8) = 0.00001;
   init_P(9,9) = init_P(10,10) = init_P(11,11) = 0.00001;
@@ -170,15 +173,15 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf &kf_state, in
   init_P(18,18) = init_P(19,19) = init_P(20,20) = 0.001;
   init_P(21,21) = init_P(22,22) = init_P(23,23) = 0.00001; 
   kf_state.change_P(init_P);
-  last_imu_ = meas.imu.back();
+  last_imu_ = meas.imu.back(); //记录最后一个IMU数据
 
   // std::cout << "IMU init new -- init_state  " << init_state.pos  <<" " << init_state.bg <<" " << init_state.ba <<" " << init_state.grav << std::endl;
 }
 
-//反向传播
+//前向传播、反向传播、去畸变
 void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf &kf_state, PointCloudXYZI &pcl_out)
 {
-  /***将上一帧最后尾部的imu添加到当前帧头部的imu ***/
+  /***将上一帧尾部最后一个imu添加到当前帧头部 ***/
   auto v_imu = meas.imu;         //取出当前帧的IMU队列
   v_imu.push_front(last_imu_);   //将上一帧最后尾部的imu添加到当前帧头部的imu
   const double &imu_end_time = v_imu.back()->header.stamp.toSec();    //拿到当前帧尾部的imu的时间
@@ -202,12 +205,12 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf &kf_state
   double dt = 0;
 
   input_ikfom in;
-  // 遍历本次估计的所有IMU测量并且进行积分，离散中值法 前向传播
+  // 遍历当前雷达帧时间内的所有IMU测量并且进行积分，离散中值法 前向传播
   for (auto it_imu = v_imu.begin(); it_imu < (v_imu.end() - 1); it_imu++)
   {
-    auto &&head = *(it_imu);        //拿到当前帧的imu数据
-    auto &&tail = *(it_imu + 1);    //拿到下一帧的imu数据
-    //判断时间先后顺序：下一帧时间戳是否小于上一帧结束时间戳 不符合直接continue
+    auto &&head = *(it_imu);        //第it_imu个imu数据
+    auto &&tail = *(it_imu + 1);    //第it_imu+1个的imu数据
+    //判断时间先后顺序：如果下一个IMU的时间戳小于上一个IMU结束时间戳，显然发生了错误，直接continue
     if (tail->header.stamp.toSec() < last_lidar_end_time_)    continue;
     
     angvel_avr<<0.5 * (head->angular_velocity.x + tail->angular_velocity.x),      // 中值积分
@@ -219,10 +222,10 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf &kf_state
 
     acc_avr  = acc_avr * G_m_s2 / mean_acc.norm(); //通过重力数值对加速度进行调整(除上初始化的IMU大小*9.8)
 
-    //如果IMU开始时刻早于上次雷达最晚时刻(因为将上次最后一个IMU插入到此次开头了，所以会出现一次这种情况)
+    //会有一次IMU数据开始时刻早于上次雷达帧结束时刻，单独处理一下(因为将上次最后一个IMU插入到此次开头了，所以会出现一次这种情况)
     if(head->header.stamp.toSec() < last_lidar_end_time_)
     {
-      dt = tail->header.stamp.toSec() - last_lidar_end_time_; //从上次雷达时刻末尾开始传播 计算与此次IMU结尾之间的时间差
+      dt = tail->header.stamp.toSec() - last_lidar_end_time_; //从上次雷达时刻末尾开始传播 计算与tail之间的时间差
     }
     else
     {
@@ -238,57 +241,60 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf &kf_state
 
     kf_state.predict(dt, Q, in);    // IMU前向传播，每次传播的时间间隔为dt
 
-    imu_state = kf_state.get_x();   //更新IMU状态为积分后的状态
-    //更新上一帧角速度 = 后一帧角速度-bias  
+    imu_state = kf_state.get_x();   //更新IMU状态为前向传播后的状态
+    
+    //更新angvel_last = tail角速度-前向传播更新后的bias  
     angvel_last = V3D(tail->angular_velocity.x, tail->angular_velocity.y, tail->angular_velocity.z) - imu_state.bg;
-    //更新上一帧世界坐标系下的加速度 = R*(加速度-bias) - g
+    
+    //更新世界坐标系下的加速度acc_s_last = R*(加速度-bias) - g
     acc_s_last  = V3D(tail->linear_acceleration.x, tail->linear_acceleration.y, tail->linear_acceleration.z) * G_m_s2 / mean_acc.norm();   
-
     // std::cout << "acc_s_last: " << acc_s_last.transpose() << std::endl;
     // std::cout << "imu_state.ba: " << imu_state.ba.transpose() << std::endl;
     // std::cout << "imu_state.grav: " << imu_state.grav.transpose() << std::endl;
     acc_s_last = imu_state.rot * (acc_s_last - imu_state.ba) + imu_state.grav;
     // std::cout << "--acc_s_last: " << acc_s_last.transpose() << std::endl<< std::endl;
 
-    double &&offs_t = tail->header.stamp.toSec() - pcl_beg_time;    //后一个IMU时刻距离此次雷达开始的时间间隔
+    double &&offs_t = tail->header.stamp.toSec() - pcl_beg_time;    //IMU时刻和这一雷达帧开始时刻的时间间隔，将会存到每个IMUpose的offset_time里
+    //将这一帧雷达点云时间内的所有的IMU的状态记录下来、包括与雷达帧开始时刻的时间间隔、加速度、角速度、速度、位置、旋转
     IMUpose.push_back( set_pose6d( offs_t, acc_s_last, angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.matrix() ) );
   }
 
-  // 把最后一帧IMU测量也补上
-  dt = abs(pcl_end_time - imu_end_time);
-  kf_state.predict(dt, Q, in);
-  imu_state = kf_state.get_x();   
+  // 前面的for循环里面没处理最后一个IMU数据到雷达帧末尾的传播，这里补上单独处理一下
+  dt = abs(pcl_end_time - imu_end_time); //dt就是从最后一个IMU数据时间戳到该雷达帧结束时刻的时间戳
+  kf_state.predict(dt, Q, in);  //前向传播
+  imu_state = kf_state.get_x(); //更新imu_state
   last_imu_ = meas.imu.back();              //保存最后一个IMU测量，以便于下一帧使用
   last_lidar_end_time_ = pcl_end_time;      //保存这一帧最后一个雷达测量的结束时间，以便于下一帧使用
 
    /***消除每个激光雷达点的失真（反向传播）***/
-  if (pcl_out.points.begin() == pcl_out.points.end()) return;
+  if (pcl_out.points.begin() == pcl_out.points.end()) return; // 检查点云是空的，直接返回
   auto it_pcl = pcl_out.points.end() - 1;
 
-  //遍历每个IMU帧
+  //遍历雷达帧覆盖时间内的每个IMU，注意这里是从最晚的一个开始，往前遍历
   for (auto it_kp = IMUpose.end() - 1; it_kp != IMUpose.begin(); it_kp--)
   {
     auto head = it_kp - 1;
     auto tail = it_kp;
-    R_imu<<MAT_FROM_ARRAY(head->rot);   //拿到前一帧的IMU旋转矩阵
+    R_imu<<MAT_FROM_ARRAY(head->rot);   //head IMU旋转矩阵
     // cout<<"head imu acc: "<<acc_imu.transpose()<<endl;
-    vel_imu<<VEC_FROM_ARRAY(head->vel);     //拿到前一帧的IMU速度
-    pos_imu<<VEC_FROM_ARRAY(head->pos);     //拿到前一帧的IMU位置
-    acc_imu<<VEC_FROM_ARRAY(tail->acc);     //拿到后一帧的IMU加速度
-    angvel_avr<<VEC_FROM_ARRAY(tail->gyr);  //拿到后一帧的IMU角速度
+    vel_imu<<VEC_FROM_ARRAY(head->vel);     //head IMU速度
+    pos_imu<<VEC_FROM_ARRAY(head->pos);     //head IMU位置
+    acc_imu<<VEC_FROM_ARRAY(tail->acc);     //tail IMU加速度
+    angvel_avr<<VEC_FROM_ARRAY(tail->gyr);  //tail IMU角速度
 
     //之前点云按照时间从小到大排序过，IMUpose也同样是按照时间从小到大push进入的
-    //此时从IMUpose的末尾开始循环，也就是从时间最大处开始，因此只需要判断 点云时间需>IMU head时刻  即可   不需要判断 点云时间<IMU tail
+    //此时从IMUpose的末尾开始循环，也就是从时间最大处开始，因此只需要判断 点云时间需>IMU head时刻即可，不需要判断点云时间<IMU tail
     for(; it_pcl->curvature / double(1000) > head->offset_time; it_pcl --)
     {
-      dt = it_pcl->curvature / double(1000) - head->offset_time;    //点到IMU开始时刻的时间间隔 
+      dt = it_pcl->curvature / double(1000) - head->offset_time;    //点和head IMU时刻之间的时间间隔。curvature是点到雷达帧开始时刻的时间差。offset_time是该IMU_pose到这一帧雷达帧开始时刻的时间差
 
       /*    P_compensate = R_imu_e ^ T * (R_i * P_i + T_ei)    */
 
-      M3D R_i(R_imu * Sophus::SO3::exp(angvel_avr * dt).matrix() );   //点it_pcl所在时刻的旋转：前一帧的IMU旋转矩阵 * exp(后一帧角速度*dt)   
+      M3D R_i(R_imu * Sophus::SO3::exp(angvel_avr * dt).matrix() );   //该点时间戳下IMU坐标系相对于世界坐标系的旋转：head IMU旋转矩阵 * exp(tail角速度*dt)   
       
-      V3D P_i(it_pcl->x, it_pcl->y, it_pcl->z);   //点所在时刻的位置(雷达坐标系下)
-      V3D T_ei(pos_imu + vel_imu * dt + 0.5 * acc_imu * dt * dt - imu_state.pos);   //从点所在的世界位置-雷达末尾世界位置
+      V3D P_i(it_pcl->x, it_pcl->y, it_pcl->z);   //点在自身时间戳时雷达坐标系下的位置()
+      V3D T_ei(pos_imu + vel_imu * dt + 0.5 * acc_imu * dt * dt - imu_state.pos);   //该点时间戳下IMU坐标系的世界位置 - 雷达帧结束时刻的IMU世界位置
+      // 畸变矫正之后的点的位置（在雷达帧结束时刻的雷达坐标系中描述）
       V3D P_compensate = imu_state.offset_R_L_I.matrix().transpose() * (imu_state.rot.matrix().transpose() * (R_i * (imu_state.offset_R_L_I.matrix() * P_i + imu_state.offset_T_L_I) + T_ei) - imu_state.offset_T_L_I);
 
       it_pcl->x = P_compensate(0);
@@ -309,6 +315,7 @@ void ImuProcess::Process(const MeasureGroup &meas, esekfom::esekf &kf_state, Poi
   if(meas.imu.empty()) {return;};
   ROS_ASSERT(meas.lidar != nullptr);
 
+  // 如果IMU 初始化还没有完成，那么这一帧的IMU数据继续拿来用作初始化
   if (imu_need_init_)   
   {
     // The very first lidar frame
@@ -320,8 +327,10 @@ void ImuProcess::Process(const MeasureGroup &meas, esekfom::esekf &kf_state, Poi
 
     state_ikfom imu_state = kf_state.get_x();
 
+    // IMU_init()里面迭代次数比 MAX_INI_COUNT 多的话，就可以结束初始化了
     if (init_iter_num > MAX_INI_COUNT)
     {
+      //what?这里写了些啥？？IMU_init()初始化的cov_acc白算了？
       cov_acc *= pow(G_m_s2 / mean_acc.norm(), 2);
       imu_need_init_ = false;
 
@@ -333,6 +342,7 @@ void ImuProcess::Process(const MeasureGroup &meas, esekfom::esekf &kf_state, Poi
     return;
   }
 
+  // 初始化完成后，进行前向传播和反向传播点云去畸变，去畸变之后的点云存放在cur_pcl_un_中。
   UndistortPcl(meas, kf_state, *cur_pcl_un_); 
 
   // T2 = omp_get_wtime();

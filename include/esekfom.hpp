@@ -91,7 +91,7 @@ namespace esekfom
 
 			f_x_ = Matrix<double, 24, 24>::Identity() + f_x_ * dt; //之前Fx矩阵里的项没加单位阵，没乘dt   这里补上
 
-			P_ = (f_x_)*P_ * (f_x_).transpose() + (dt * f_w_) * Q * (dt * f_w_).transpose(); //传播协方差矩阵，即公式(8)
+			P_ = (f_x_)*P_ * (f_x_).transpose() + (dt * f_w_) * Q * (dt * f_w_).transpose(); //传播协方差矩阵，即公式(8) f_w_之前也没乘dt，这里乘上
 		}
 
 		//计算每个特征点的残差及H矩阵
@@ -107,7 +107,7 @@ namespace esekfom
 #pragma omp parallel for
 #endif
 
-			for (int i = 0; i < feats_down_size; i++) //遍历所有的特征点
+			for (int i = 0; i < feats_down_size; i++) //遍历这一帧中所有的激光点
 			{
 				PointType &point_body = feats_down_body->points[i];
 				PointType point_world;
@@ -120,13 +120,14 @@ namespace esekfom
 				point_world.z = p_global(2);
 				point_world.intensity = point_body.intensity;
 
-				vector<float> pointSearchSqDis(NUM_MATCH_POINTS);
+				vector<float> pointSearchSqDis(NUM_MATCH_POINTS);//维度为NUM_MATCH_POINTS(近邻点数量)的vector，存储点和每个近邻点之间的距离
 				auto &points_near = Nearest_Points[i]; // Nearest_Points[i]打印出来发现是按照离point_world距离，从小到大的顺序的vector
 
 				double ta = omp_get_wtime();
+				//判断是否收敛
 				if (ekfom_data.converge)
 				{
-					//寻找point_world的最近邻的平面点
+					//寻找point_world的最近邻的平面点，搜索到的近邻点存到points_near，和每个近邻点的距离存到pointSearchSqDis
 					ikdtree.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
 					//判断是否是有效匹配点，与loam系列类似，要求特征点最近邻的地图点数量>阈值，距离<阈值  满足条件的才置为true
 					point_selected_surf[i] = points_near.size() < NUM_MATCH_POINTS ? false : pointSearchSqDis[NUM_MATCH_POINTS - 1] > 5 ? false
@@ -136,8 +137,8 @@ namespace esekfom
 					continue; //如果该点不满足条件  不进行下面步骤
 
 				Matrix<float, 4, 1> pabcd;		//平面点信息
-				point_selected_surf[i] = false; //将该点设置为无效点，用来判断是否满足条件
-				//拟合平面方程ax+by+cz+d=0并求解点到平面距离
+				point_selected_surf[i] = false; //用来判断是否满足条件 首先将该点设置为无效点，
+				//拟合平面方程ax+by+cz+d=0并求解点到平面距离，并且判断近邻点算出来的平面是不是一个好的平面
 				if (esti_plane(pabcd, points_near, 0.1f))
 				{
 					float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y + pabcd(2) * point_world.z + pabcd(3); //当前点到平面的距离
@@ -165,6 +166,7 @@ namespace esekfom
 				}
 			}
 
+			//满足要求的点太少了
 			if (effct_feat_num < 1)
 			{
 				ekfom_data.valid = false;
@@ -194,11 +196,13 @@ namespace esekfom
 				V3D A(point_I_crossmat * C);
 				if (extrinsic_est)
 				{
+					//如果需要优化外参，则雅可比的形式形式如下
 					V3D B(point_crossmat * x_.offset_R_L_I.matrix().transpose() * C);
 					ekfom_data.h_x.block<1, 12>(i, 0) << norm_p.x, norm_p.y, norm_p.z, VEC_FROM_ARRAY(A), VEC_FROM_ARRAY(B), VEC_FROM_ARRAY(C);
 				}
 				else
 				{
+					//如果不需要优化外参，则雅可比的形式形式如下
 					ekfom_data.h_x.block<1, 12>(i, 0) << norm_p.x, norm_p.y, norm_p.z, VEC_FROM_ARRAY(A), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
 				}
 
@@ -235,7 +239,7 @@ namespace esekfom
 			dyn_share_datastruct dyn_share;
 			dyn_share.valid = true;
 			dyn_share.converge = true;
-			int t = 0;
+			int t = 0;//迭代次数t
 			state_ikfom x_propagated = x_; //这里的x_和P_分别是经过正向传播后的状态量和协方差矩阵，因为会先调用predict函数再调用这个函数
 			cov P_propagated = P_;
 
@@ -273,6 +277,7 @@ namespace esekfom
 				dyn_share.converge = true;
 				for (int j = 0; j < 24; j++)
 				{
+					// 检查此次迭代的dx_中的每个量，如果有任意一个大于 epsi 就认为还没有收敛，继续迭代
 					if (std::fabs(dx_[j]) > epsi) //如果dx>epsi 认为没有收敛
 					{
 						dyn_share.converge = false;
@@ -290,15 +295,15 @@ namespace esekfom
 
 				if (t > 1 || i == maximum_iter - 1)
 				{
-					P_ = (Matrix<double, 24, 24>::Identity() - KH) * P_; //公式(19)
+					P_ = (Matrix<double, 24, 24>::Identity() - KH) * P_; //公式(19) 更新协方差矩阵
 					return;
 				}
 			}
 		}
 
 	private:
-		state_ikfom x_;
-		cov P_ = cov::Identity();
+		state_ikfom x_;				//状态量 24*1
+		cov P_ = cov::Identity();	//协方差矩阵 24*24
 	};
 
 } // namespace esekfom

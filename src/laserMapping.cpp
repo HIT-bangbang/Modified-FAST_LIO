@@ -56,7 +56,7 @@ bool lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 
 vector<BoxPointType> cub_needrm;
-vector<PointVector> Nearest_Points;
+vector<PointVector> Nearest_Points;//一帧点云中，每个点的近邻点。
 vector<double> extrinT(3, 0.0);
 vector<double> extrinR(9, 0.0);
 deque<double> time_buffer;
@@ -271,13 +271,14 @@ void lasermap_fov_segment()
     cub_needrm.clear(); // 清空需要移除的区域
     kdtree_delete_counter = 0;
 
-    V3D pos_LiD = pos_lid; // W系下位置
+    V3D pos_LiD = pos_lid; // 注意在调用这个函数之前，pos_lid已经被更新为雷达坐标系在世界坐标系下的位置
     //初始化局部地图范围，以pos_LiD为中心,长宽高均为cube_len
     if (!Localmap_Initialized)
     {
+        //如果是第一次进入这个函数，就要对局部地图进行初始化
         for (int i = 0; i < 3; i++)
         {
-            LocalMap_Points.vertex_min[i] = pos_LiD(i) - cube_len / 2.0;
+            LocalMap_Points.vertex_min[i] = pos_LiD(i) - cube_len / 2.0; //注意，cube_len是在launch里面指定的参数，表示局部地图的长度
             LocalMap_Points.vertex_max[i] = pos_LiD(i) + cube_len / 2.0;
         }
         Localmap_Initialized = true;
@@ -300,7 +301,7 @@ void lasermap_fov_segment()
 
     BoxPointType New_LocalMap_Points, tmp_boxpoints;
     New_LocalMap_Points = LocalMap_Points;
-    //需要移动的距离
+    //需要移动的距离，经验公式
     float mov_dist = max((cube_len - 2.0 * MOV_THRESHOLD * DET_RANGE) * 0.5 * 0.9, double(DET_RANGE * (MOV_THRESHOLD - 1)));
     for (int i = 0; i < 3; i++)
     {
@@ -309,7 +310,7 @@ void lasermap_fov_segment()
         {
             New_LocalMap_Points.vertex_max[i] -= mov_dist;
             New_LocalMap_Points.vertex_min[i] -= mov_dist;
-            tmp_boxpoints.vertex_min[i] = LocalMap_Points.vertex_max[i] - mov_dist;
+            tmp_boxpoints.vertex_min[i] = LocalMap_Points.vertex_max[i] - mov_dist;//需要移除的点的范围
             cub_needrm.push_back(tmp_boxpoints);
         }
         else if (dist_to_map_edge[i][1] <= MOV_THRESHOLD * DET_RANGE)
@@ -320,10 +321,10 @@ void lasermap_fov_segment()
             cub_needrm.push_back(tmp_boxpoints);
         }
     }
-    LocalMap_Points = New_LocalMap_Points;
+    LocalMap_Points = New_LocalMap_Points;//更新到LocalMap的边界
 
     PointVector points_history;
-    ikdtree.acquire_removed_points(points_history);
+    ikdtree.acquire_removed_points(points_history);//历史记录，实际上没有用到
 
     if (cub_needrm.size() > 0)
         kdtree_delete_counter = ikdtree.Delete_Point_Boxes(cub_needrm); //删除指定范围内的点
@@ -369,9 +370,9 @@ void map_incremental()
             }
             for (int j = 0; j < NUM_MATCH_POINTS; j++)
             {
-                if (points_near.size() < NUM_MATCH_POINTS)
+                if (points_near.size() < NUM_MATCH_POINTS)//如果近邻点的数量小于5直接break
                     break;
-                if (calc_dist(points_near[j], mid_point) < dist) //如果近邻点距离 < 当前点距离，不添加该点
+                if (calc_dist(points_near[j], mid_point) < dist) //如果近邻点到体素中心距离 < 当前点到体素中心距离，不添加该点
                 {
                     need_add = false;
                     break;
@@ -620,12 +621,15 @@ int main(int argc, char **argv)
 
             if (flg_first_scan)
             {
+                // 如果是第一帧
                 first_lidar_time = Measures.lidar_beg_time;
                 p_imu1->first_lidar_time = first_lidar_time;
                 flg_first_scan = false;
                 continue;
             }
 
+            // 从第二帧之后，首先进行IMU处理，初始化、前向传播、反向传播、点云去畸变
+            // 前向传播之后的状态量存到了 kf.x_ 的成员变量中，去畸变之后的点云存到了feats_undistort里面
             p_imu1->Process(Measures, kf, feats_undistort);
 
             //如果feats_undistort为空 ROS_WARN
@@ -635,14 +639,14 @@ int main(int argc, char **argv)
                 continue;
             }
 
-            state_point = kf.get_x();
-            pos_lid = state_point.pos + state_point.rot.matrix() * state_point.offset_T_L_I;
+            state_point = kf.get_x();   //获取前向传播之后的状态
+            pos_lid = state_point.pos + state_point.rot.matrix() * state_point.offset_T_L_I;// 计算雷达坐标系在世界坐标系下的位置
 
             flg_EKF_inited = (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? false : true;
 
             lasermap_fov_segment(); //更新localmap边界，然后降采样当前帧点云
 
-            //点云下采样
+            //点云下采样，使用PCL的函数
             downSizeFilterSurf.setInputCloud(feats_undistort);
             downSizeFilterSurf.filter(*feats_down_body);
             feats_down_size = feats_down_body->points.size();
@@ -650,23 +654,24 @@ int main(int argc, char **argv)
             // std::cout << "feats_down_size :" << feats_down_size << std::endl;
             if (feats_down_size < 5)
             {
-                ROS_WARN("No point, skip this scan!\n");
+                ROS_WARN("No point, skip this scan!\n");//如果下采样之后的点云太少了，抛出警告并且跳过这一帧测量
                 continue;
             }
 
             //初始化ikdtree(ikdtree为空时)
             if (ikdtree.Root_Node == nullptr)
             {
-                ikdtree.set_downsample_param(filter_size_map_min);
+                ikdtree.set_downsample_param(filter_size_map_min); //ikdtree构建时可以同时进行下采样，这里设置下采样的大小参数为filter_size_map_min
                 feats_down_world->resize(feats_down_size);
                 for (int i = 0; i < feats_down_size; i++)
                 {
-                    pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i])); // lidar坐标系转到世界坐标系
+                    pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i])); // 将点云从lidar坐标系转到世界坐标系
                 }
-                ikdtree.Build(feats_down_world->points); //根据世界坐标系下的点构建ikdtree
+                ikdtree.Build(feats_down_world->points); //将转换到世界坐标系下的点云构建ikdtree
                 continue;
             }
 
+            //是否要
             if (0) // If you need to see map point, change to "if(1)"
             {
                 PointVector().swap(ikdtree.PCL_Storage);
@@ -677,18 +682,19 @@ int main(int argc, char **argv)
             }
 
             /*** iterated state estimation ***/
-            Nearest_Points.resize(feats_down_size); //存储近邻点的vector
+            Nearest_Points.resize(feats_down_size); //存储近邻点的vector，resize 成这一帧点云的维度
+            //ieskf迭代更新
             kf.update_iterated_dyn_share_modified(LASER_POINT_COV, feats_down_body, ikdtree, Nearest_Points, NUM_MAX_ITERATIONS, extrinsic_est_en);
 
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot.matrix() * state_point.offset_T_L_I;
 
             /******* Publish odometry *******/
-            publish_odometry(pubOdomAftMapped);
+            publish_odometry(pubOdomAftMapped);//f发布里程计
 
             /*** add the feature points to map kdtree ***/
             feats_down_world->resize(feats_down_size);
-            map_incremental();
+            map_incremental();  //地图更新
 
             /******* Publish points *******/
             if (path_en)
