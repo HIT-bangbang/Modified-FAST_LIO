@@ -41,12 +41,24 @@ void Preprocess::set(bool feat_en, int lid_type, double bld, int pfilt_num)
   point_filter_num = pfilt_num;
 }
 
+/**
+ * @brief: 将 livox 雷达的消息转换成PCL类型，并进行预处理
+ * @param {livox_ros_driver::CustomMsg::ConstPtr} &msg
+ * @param {PointCloudXYZI::Ptr} &pcl_out
+ * @return {*}
+ */
 void Preprocess::process(const livox_ros_driver::CustomMsg::ConstPtr &msg, PointCloudXYZI::Ptr &pcl_out)
 {
   avia_handler(msg);
   *pcl_out = pl_surf;
 }
 
+/**
+ * @brief: 根据雷达的类型，调用不同的处理函数 将 PointCloud2 类型的点云转换成 PCL 的点云类型，并进行预处理
+ * @param {sensor_msgs::PointCloud2::ConstPtr} &msg
+ * @param {PointCloudXYZI::Ptr} &pcl_out
+ * @return {*}
+ */
 void Preprocess::process(const sensor_msgs::PointCloud2::ConstPtr &msg, PointCloudXYZI::Ptr &pcl_out)
 {
   switch (time_unit)
@@ -67,7 +79,7 @@ void Preprocess::process(const sensor_msgs::PointCloud2::ConstPtr &msg, PointClo
     time_unit_scale = 1.f;
     break;
   }
-
+  // 根据雷达的类型，调用不同的处理函数
   switch (lidar_type)
   {
   case OUST64:
@@ -939,15 +951,23 @@ bool Preprocess::edge_jump_judge(const PointCloudXYZI &pl, vector<orgtype> &type
   return true;
 }
 
+/**
+ * @brief: robosense 雷达点云的预处理，将输入的 PointCloud2 类型 转换成 PCL 点云类型，并且做预处理，结果点云存储在 pl_surf 中
+ * @param {const sensor_msgs::PointCloud2_<allocator<void>>::ConstPtr} &msg 输入的点云
+ * @return {*}
+ */
 void Preprocess::rs_handler(const sensor_msgs::PointCloud2_<allocator<void>>::ConstPtr &msg)
 {
-  pl_surf.clear();
+  pl_surf.clear();  // 首先将 clear 一下，因为 pl_surf 存储后面预处理的结果，把之前的clear掉
 
-  pcl::PointCloud<rslidar_ros::Point> pl_orig;
-  pcl::fromROSMsg(*msg, pl_orig);
-  int plsize = pl_orig.points.size();
-  pl_surf.reserve(plsize);
+  pcl::PointCloud<rslidar_ros::Point> pl_orig;  // 一个临时的点云
+  pcl::fromROSMsg(*msg, pl_orig);               // PointCloud2 直接转成 PCL 格式
+  int plsize = pl_orig.points.size();           // 获取点云的点的数量
+  pl_surf.reserve(plsize);                      // 根据原始的点云的数量，先开辟出来这么大的内存
 
+  // 如果你的激光雷达发布的点云中的点激光是没有时间戳的话，就认为每个点都是以固定的时间间隔采样得到的，人为计算一个时间戳出来。
+  // 下面的变量就是用来人工计算时间戳的。
+  // 但是，大多数雷达的激光点都是带时间戳的，所以一般用不到
   /*** These variables only works when no point timestamps given ***/
   double omega_l = 0.361 * SCAN_RATE; // scan angular velocity
   std::vector<bool> is_first(N_SCANS, true);
@@ -956,12 +976,12 @@ void Preprocess::rs_handler(const sensor_msgs::PointCloud2_<allocator<void>>::Co
   std::vector<float> time_last(N_SCANS, 0.0); // last offset time
   /*****************************************************************/
 
-  if (pl_orig.points[plsize - 1].timestamp > 0) // todo check pl_orig.points[plsize - 1].time
+  if (pl_orig.points[plsize - 1].timestamp > 0) // 激光点有时间戳 > 0，说明我们拿到的点云中激光点都是有时间戳的，不用人为计算了  // todo check pl_orig.points[plsize - 1].time
   {
     given_offset_time = true;
     // std::cout << "given_offset_time = true " << std::endl;
   }
-  else
+  else  //激光点没有时间戳 > 0，那就得计算一下。 一般不会执行
   {
     given_offset_time = false;
     double yaw_first = atan2(pl_orig.points[0].y, pl_orig.points[0].x) * 57.29578; // 记录第一个点(index 0)的yaw， to degree
@@ -977,6 +997,7 @@ void Preprocess::rs_handler(const sensor_msgs::PointCloud2_<allocator<void>>::Co
     }
   }
 
+  // 遍历 pl_orig 中的每个点，将其赋值到 added_pt 中
   for (int i = 0; i < plsize; i++)
   {
     PointType added_pt;
@@ -987,10 +1008,11 @@ void Preprocess::rs_handler(const sensor_msgs::PointCloud2_<allocator<void>>::Co
     added_pt.x = pl_orig.points[i].x;
     added_pt.y = pl_orig.points[i].y;
     added_pt.z = pl_orig.points[i].z;
-    added_pt.intensity = pl_orig.points[i].intensity;
-    added_pt.curvature = (pl_orig.points[i].timestamp - pl_orig.points[0].timestamp) * 1000.0; // curvature unit: ms 只是借用了curvature的位置来存一下每个点相对于第一个点的相对时间
+    added_pt.intensity = pl_orig.points[i].intensity; // 强度
+    added_pt.curvature = (pl_orig.points[i].timestamp - pl_orig.points[0].timestamp) * 1000.0; // curvature  只是借用了curvature的位置来存储，该点相对于所在帧的第一个点的相对时间 unit: ms
     // std::cout << "added_pt.curvature:" << added_pt.curvature << std::endl;
 
+    // 无时间戳的激光点数据，人工赋予时间戳 一般不会执行
     if (!given_offset_time)
     {
       int layer = pl_orig.points[i].ring;
@@ -1024,12 +1046,13 @@ void Preprocess::rs_handler(const sensor_msgs::PointCloud2_<allocator<void>>::Co
       time_last[layer] = added_pt.curvature;
     }
 
-    // 一个很粗暴的下采样和盲区
-    if (i % point_filter_num == 0)
+    // 一个很粗暴的下采样和盲区剔除
+    if (i % point_filter_num == 0)    // 下采样，每隔 point_filter_num 个点取一个
     {
+      // 如果 x^2+y^2+z^2 > blind^2 就认为该点在盲区之外。
       if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind) )
       {
-        pl_surf.points.push_back(added_pt);
+        pl_surf.points.push_back(added_pt); // 只有在盲区之外才会被加入到 pl_surf 中
       }
     }
   }
