@@ -297,6 +297,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf &kf_state
    */
 
   if (pcl_out.points.begin() == pcl_out.points.end()) return; // 头指针=尾指针 即点云是空的，直接返回
+  auto it_pcl = pcl_out.points.end() - 1;
 
   //遍历雷达帧覆盖时间内的每个IMU状态，注意这里是end（时间戳最小）开始，往前遍历该帧时间范围内的所有IMUpose
   /**
@@ -316,7 +317,6 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf &kf_state
 
     //之前点云按照时间从小到大排序过，IMUpose也同样是按照时间从小到大push进入的。时间戳：begin--小  end--大
     //此时从pcl_out的末尾开始往前遍历，也就是从时间戳最大的点开始往小遍历，因此只需要判断 点的时间戳 >IMU head时刻即可，不需要判断点云时间<IMU tail
-    auto it_pcl = pcl_out.points.end() - 1;
     for(; it_pcl->curvature / double(1000) > head->offset_time; it_pcl --)
     {
       dt = it_pcl->curvature / double(1000) - head->offset_time;    //点和head IMU时刻之间的时间间隔。curvature是点到雷达帧开始时刻的时间差。offset_time是该IMU_pose到这一帧雷达帧开始时刻的时间差
